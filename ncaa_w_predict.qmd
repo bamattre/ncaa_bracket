@@ -1,0 +1,216 @@
+---
+title: "NCAA Womens Predictions"
+format: html
+editor: visual
+---
+
+## NCAA Womens Predictions
+
+```{r}
+library(tidyverse)
+library(wehoop)
+library(limSolve)
+```
+
+```{r}
+pbp <- wehoop::load_wbb_pbp()
+
+box <- wehoop::load_wbb_team_box()
+
+sched <- wehoop::load_wbb_schedule()
+```
+
+```{r}
+table(box$season)
+```
+
+```{r}
+ex_data <- box |> 
+  group_by(game_id) |> 
+  summarize(WTeamID = team_id[team_winner == TRUE],
+            WScore = team_score[team_winner == TRUE],
+            LTeamID = team_id[team_winner == FALSE],
+            LScore = team_score[team_winner == FALSE],
+            WLoc = team_home_away[team_winner == TRUE]) |> 
+  mutate(WLoc = if_else(WLoc == "away", "A", "H"))
+```
+
+[Using this breakdown for RPI](https://dpmartin42.github.io/posts/r/college-basketball-rankings)
+
+```{r}
+# Team winning percentage
+
+calc_wp <- function(game_data, team_id, exclusion_id = NULL){
+  
+  games_played <- game_data[game_data$WTeamID == team_id | game_data$LTeamID == team_id, ]
+
+  if(!is.null(exclusion_id)){
+    
+    games_played <- 
+      games_played[games_played$WTeamID != exclusion_id & games_played$LTeamID != exclusion_id, ]
+    
+    wp <- sum(games_played$WTeamID == team_id)/length(games_played$WTeamID)
+    
+  } else{
+    
+    wwins <- 1.4 * sum(games_played$WTeamID == team_id & games_played$WLoc == "A") +
+      0.6 * sum(games_played$WTeamID == team_id & games_played$WLoc == "H") +
+      sum(games_played$WTeamID == team_id & games_played$WLoc == "N")
+    
+    wlosses <- 1.4 * sum(games_played$LTeamID == team_id & games_played$WLoc == "A") +
+      0.6 * sum(games_played$LTeamID == team_id & games_played$WLoc == "H") +
+      sum(games_played$LTeamID == team_id & games_played$WLoc == "N")
+    
+    wp <- wwins/(wwins + wlosses)
+    
+  }
+
+  return(wp)
+  
+}
+
+calc_wp(ex_data, team_id = "300")
+```
+
+```{r}
+# Opponents winning percentage (exclusive of the reference team)
+
+calc_owp <- function(game_data, team_id){
+  
+  opp_games <- game_data[game_data$WTeamID == team_id | game_data$LTeamID == team_id, ]
+  opps <- if_else(opp_games$WTeamID == team_id, opp_games$LTeamID, opp_games$WTeamID)
+  
+  owp <- opps %>%
+    map_dbl(~ calc_wp(game_data, team_id = .x, exclusion_id = team_id))
+  
+  return(mean(owp, na.rm = TRUE))
+  
+}
+
+calc_owp(ex_data, team_id = "300")
+```
+
+```{r}
+# Opponents opponents winning percentage
+
+calc_oowp <- function(game_data, team_id){
+  
+  opp_games <- game_data[game_data$WTeamID == team_id | game_data$LTeamID == team_id, ]
+  opps <- if_else(opp_games$WTeamID == team_id, opp_games$LTeamID, opp_games$WTeamID)
+  
+  oowp <- opps %>%
+    map_dbl(~ calc_owp(game_data, team_id = .x))
+  
+  return(mean(oowp, na.rm = TRUE))
+  
+}
+
+calc_oowp(ex_data, team_id = "300")
+```
+
+```{r}
+# RPI using weighted formula
+
+calc_rpi <- function(game_data, team_id){
+  
+  rpi <- 0.25 * calc_wp(game_data, team_id) +
+    0.5 * calc_owp(game_data, team_id) +
+    0.25 * calc_oowp(game_data, team_id)
+  
+  return(round(rpi, 4))
+ 
+}
+
+calc_rpi(ex_data, team_id = "300")
+```
+
+Calculate RPI for all teams
+
+```{r}
+ex_teams <- unique(c(ex_data$WTeamID, ex_data$LTeamID))
+
+rpi <- tibble(Team = ex_teams,
+              RPI = map_dbl(ex_teams, ~ calc_rpi(ex_data, team_id = .x)))
+```
+
+SRS
+
+```{r}
+all_teams <- unique(c(ex_data$WTeamID, ex_data$LTeamID))
+
+# Function to create column vector of wins/losses for each team in every game
+
+transform_wl <- function(game_data, team_id){
+  
+  col_w <- if_else(game_data$WTeamID == team_id, 1, 0) %>%
+    na_if(0)
+  
+  col_l <- if_else(game_data$LTeamID == team_id, -1, 0) %>%
+    na_if(0)
+  
+  col_all <- coalesce(col_w, col_l) %>%
+    as_tibble()
+  
+  return(col_all)
+  
+}
+
+# Replace NAs with 0 and cbind home/away column
+
+srs_ex <- map(all_teams, ~ transform_wl(ex_data, team_id = .x)) %>%
+  bind_cols() %>%
+  setNames(all_teams) %>%
+  replace(is.na(.), 0) %>%
+  mutate(loc = fct_recode(ex_data$WLoc, "1" = "H", "-1" = "A", "0" = "N")) %>%
+  mutate(loc = as.numeric(as.character(loc))) %>%
+  select(loc, everything()) %>%
+  as.matrix()
+```
+
+```{r}
+scorediff_ex <- ex_data %>%
+  mutate(scorediff = WScore - LScore) %>%
+  select(scorediff) %>% 
+  as.matrix()
+
+results_ex <- lsei(srs_ex, scorediff_ex)
+
+sds <- tibble(Team = colnames(srs_ex),
+              SRS = results_ex[[1]])
+```
+
+Putting it together
+
+```{r}
+teams <- left_join(rpi,
+                   sds |> mutate(Team = as.numeric(Team)),
+                   by = "Team") |> 
+  left_join(box |> 
+              distinct(team_id, team_location, team_name, team_abbreviation), 
+            by = c("Team" = "team_id")) |> 
+  mutate(score = RPI + SRS)
+```
+
+```{r}
+games <- sched |>
+  filter(status_type_completed == FALSE) |> 
+  left_join(teams,
+            by = c("home_id" = "Team")) |> 
+  rename(home_rpi = RPI,
+         home_srs = SRS) |> 
+  left_join(teams,
+            by = c("away_id" = "Team")) |> 
+  rename(away_rpi = RPI,
+         away_srs = SRS) |> 
+  select(date, notes_headline, home_location, home_name, home_rpi, home_srs,
+         away_location, away_name, away_rpi, away_srs) |> 
+  mutate(home_score = home_rpi + home_srs,
+         away_score = away_rpi + away_srs) |> 
+  mutate(pred_winner = if_else(
+    home_score >= away_score,
+    home_location, away_location
+      ))
+
+games |> select(notes_headline, home_location, away_location, pred_winner) |> 
+       filter(!is.na(pred_winner)) # see list of predictions
+```
